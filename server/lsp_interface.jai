@@ -734,6 +734,23 @@ lsp_log :: (message : string, data : *void, info : Log_Info) {
     lsp_send(sent_log);
 }
 
+LSP_Workspace_Folder :: struct {
+    uri: string;
+    name: string;
+}
+
+LSP_Workspace_Folders_Change_Event :: struct {
+    added: []LSP_Workspace_Folder;
+    removed: []LSP_Workspace_Folder;
+}
+
+LSP_Did_Change_Workspace_Folders :: struct {
+    using notification: LSP_Notification_Message;
+    params: struct {
+        event: LSP_Workspace_Folders_Change_Event;
+    };
+}
+
 lsp_send :: (data: $T) {
     body := json_write_string(data);
     defer free(body);

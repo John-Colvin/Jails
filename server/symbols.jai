@@ -36,14 +36,13 @@ handle_workspace_symbol :: (request: LSP_Request_Message_Workspace_Symbol) {
 
     workspace_symbols: [..]LSP_Workspace_Symbol;
     for file: server.files {
-        // Skip non workspace files
-        if !begins_with(file.path, server.project_root) {
-            continue;
-        }
+        // Find which project this file belongs to
+        project := find_project_for_file(file.path);
+        if !project continue;
 
         // Skip files from local modules (we only want workspace project files)
-        for local_module_folder: server.local_modules {
-            full_local_module_folder_path := tprint("%/%", server.project_root, local_module_folder);
+        for local_module_folder: project.local_modules {
+            full_local_module_folder_path := tprint("%/%", project.project_root, local_module_folder);
 
             if begins_with(file.path, full_local_module_folder_path) {
                 continue file;

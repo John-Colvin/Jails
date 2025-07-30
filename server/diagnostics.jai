@@ -15,12 +15,26 @@ reset_diagnostics :: () {
 // Currently, parse only the first error (maybe parsing multiple errors is not that useful because Jai mostly report one error at a time)
 // @TODO: Make it work with multiple errors
 // @todo: add support for warnings
-run_diagnostics :: () {
-    if server.build_root.count == 0 return;
-    build_root_absolute := join(server.project_root, server.build_root, separator="/");
+run_diagnostics :: (file_path: string = "") {
+    project: *Project_Config;
+
+    if file_path.count > 0 {
+        project = find_project_for_file(file_path);
+    }
+
+    if !project {
+        log("No project found for diagnostics - skipping");
+        return;
+    }
+
+    if project.build_root.count == 0 {
+        log("No build_root configured for project % - skipping diagnostics", project.project_root);
+        return;
+    }
+    build_root_absolute := join(project.project_root, project.build_root, separator="/");
     defer free(build_root_absolute);
 
-    log("Running diagnostics %", build_root_absolute);
+    log("Running diagnostics % for project %", build_root_absolute, project.project_root);
 
     command: [..] string;
     defer array_free(command);
@@ -33,12 +47,13 @@ run_diagnostics :: () {
         array_add(*command, "-x64");
     }
 
-    for local_module_folder: server.local_modules {
-        array_add(*command, "-import_dir", local_module_folder);
+    for local_module_folder: project.local_modules {
+        absolute_module_path := join(project.project_root, local_module_folder, separator="/",, temp);
+        array_add(*command, "-import_dir", absolute_module_path);
     }
 
-    if server.intermediate_path.count > 0 {
-        joined := join(server.project_root, server.intermediate_path, "jails", separator="/",, temp);
+    if project.intermediate_path.count > 0 {
+        joined := join(project.project_root, project.intermediate_path, "jails", separator="/",, temp);
         normalised := normalize_path(joined,, temp);
         array_add(*command, "-", tprint("-JAILS_INTERM_PATH=%", normalised));
     }
@@ -47,7 +62,7 @@ run_diagnostics :: () {
 
     reset_diagnostics();
 
-    result, _, error := run_command(..command, working_directory=server.project_root, capture_and_return_output=true, timeout_ms=2500);
+    result, _, error := run_command(..command, working_directory=project.project_root, capture_and_return_output=true, timeout_ms=2500);
     if result.exit_code == 0 {
         return;
     }

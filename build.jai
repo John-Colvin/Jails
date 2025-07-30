@@ -28,7 +28,8 @@
         options.import_path = import_path;
 
         if release set_optimization(*options, .OPTIMIZED);
-        if release_very set_optimization(*options, .VERY_OPTIMIZED);
+        else if release_very set_optimization(*options, .VERY_OPTIMIZED);
+        else set_optimization(*options, .DEBUG);
 
         if arm options.cpu_target = .ARM64;
 

@@ -12,19 +12,34 @@ User_Options :: struct {
     auto_insert_parentheses: bool;
 }
 
+Project_Config :: struct {
+    local_modules: []string;
+    roots: []string;
+    build_root: string;
+    intermediate_path: string;
+    user_options: User_Options;
+
+    project_root: string;
+    config_loaded: bool;
+    config_file_hash: u64; // Hash of jails.json content for change detection
+
+    // Per-project allocator for all project-owned data
+    allocator: Allocator;
+    pool: Pool;
+}
+
 Server :: struct {
     quit := false;
 
     verbose: bool;
     profile: bool;
 
-    local_modules: [..]string;
-    roots: []string;
-    build_root: string;
-    intermediate_path: string;
     jai_path: string;
 
-    project_root: string;
+    // Multi-project support
+    workspace_folders: [..]string;
+    projects: Table(string, Project_Config); // project_root -> config
+
     files: Table(string, *Program_File);
     files_to_be_analyzed: [..]*Program_File;
 
@@ -34,8 +49,6 @@ Server :: struct {
     previously_errored_file: string;
 
     diagnostics_metaprogram_path: string;
-
-    user_options: User_Options;
 }
 
 server: Server;
@@ -160,7 +173,73 @@ find_jai_path :: (executable_name: string) -> string {
     return join(..path, separator="/");
 }
 
-load_config_file :: () {
+find_project_for_file :: (file_path: string) -> *Project_Config {
+    longest_match_length := 0;
+    best_project: *Project_Config = null;
+
+    for * project: server.projects {
+        if begins_with(file_path, project.project_root) {
+            if project.project_root.count > longest_match_length {
+                longest_match_length = project.project_root.count;
+                best_project = project;
+            }
+        }
+    }
+
+    return best_project;
+}
+
+init_project_config :: (project: *Project_Config) {
+    project.* = .{};
+    set_allocators(*project.pool, context.default_allocator);
+    project.allocator = .{pool_allocator_proc, *project.pool};
+}
+
+load_config_for_project :: (project_root: string) -> *Project_Config {
+    push_allocator(temp);
+    auto_release_temp();
+
+    project := table_find_pointer(*server.projects, project_root);
+
+    config_path := join(project_root, "/jails.json");
+    config_exists := file_exists(config_path);
+    current_hash: u64 = 0;
+
+    if config_exists {
+        config_content := read_entire_file(config_path);
+        current_hash = native_XXH64(config_content.data, xx config_content.count, 0);
+    }
+
+    // Check if we need to reload config
+    if project && project.config_loaded {
+        if current_hash != project.config_file_hash {
+            log("Config file changed for project %, reloading...", project_root);
+            release(*project.pool);
+            init_project_config(project);
+            project.config_loaded = false;
+            project.config_file_hash = current_hash;
+        } else {
+            return project; // No changes, return existing config
+        }
+    }
+
+    if !project {
+        project = table_add(*server.projects, copy_string(project_root,, server.projects.allocator), .{});
+        log("Adding new project: %", project_root);
+        init_project_config(project);
+        project.project_root = copy_string(project_root,, project.allocator);
+    }
+
+    if !config_exists {
+        // Set defaults for projects without config
+        project.config_loaded = true;
+        project.local_modules = .["modules"];
+        project.user_options.auto_insert_parentheses = true;
+        return project;
+    }
+
+    config_content := read_entire_file(config_path);
+
     Config :: struct {
         local_modules: []string;
         roots: []string;
@@ -170,28 +249,70 @@ load_config_file :: () {
         auto_insert_parentheses := true;
     }
 
-    config_path := join(server.project_root, "/jails.json");
-    if !file_exists(config_path) return;
-
-    config_content := read_entire_file(config_path);
-
     ok, config := json_parse_string(config_content, Config);
     if !ok {
-        log("Failed to parse config file!");
-        return;
+        log("Failed to parse config file at %!", config_path);
+        project.config_loaded = true;
+        return project;
     }
+    log("Loaded config file @ %", config_path);
 
+    // Use project allocator for all project-owned data
+    push_allocator(project.allocator);
+
+    // Copy local_modules array to project allocator
+    local_modules: [..]string;
     for config.local_modules {
-        array_add_if_unique(*server.local_modules, it);
+        array_add_if_unique(*local_modules, copy_string(it));
+    }
+    // Include default modules path
+    array_add_if_unique(*local_modules, "modules");
+    project.local_modules = local_modules;
+
+    // Copy roots array to project allocator
+    project.roots = NewArray(config.roots.count, string);
+    for i: 0..config.roots.count-1 {
+        project.roots[i] = copy_string(config.roots[i]);
     }
 
-    server.roots = config.roots;
-    server.build_root = config.build_root;
-    server.intermediate_path = config.intermediate_path;
-    server.user_options.auto_insert_parentheses = config.auto_insert_parentheses;
+    project.build_root = copy_string(config.build_root);
+    project.intermediate_path = copy_string(config.intermediate_path);
+
+    project.user_options.auto_insert_parentheses = config.auto_insert_parentheses;
+    project.config_loaded = true;
 
     if config.jai_path.count > 0 {
         server.jai_path = config.jai_path;
+    }
+
+    return project;
+}
+
+initialize_project :: (project_root: string) {
+    project := load_config_for_project(project_root);
+
+    if project.build_root.count == 0 {
+        project.build_root = find_entry_file(project_root);
+    }
+
+    if project.roots.count == 0 {
+        project.roots = .[find_entry_file(project_root)];
+    }
+
+    log("Project % - local_modules: %", project_root, project.local_modules);
+    log("Project % - roots: %", project_root, project.roots);
+    log("Project % - intermediate_path: %", project_root, project.intermediate_path);
+
+    for root: project.roots {
+        absolute_path: string;
+        if starts_with(root, "/") {
+            absolute_path = root;
+        } else {
+            absolute_path = join(project_root, root, separator="/",, temp);
+        }
+
+        absolute_path = normalize_path(absolute_path,, temp);
+        parse_file(absolute_path, true);
     }
 }
 
@@ -237,40 +358,25 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             create_diagnostics_metaprogram();
 
-            log("Root URI: %", body.params.rootUri.*);
-            log("Root Path: %", body.params.rootPath.*);
+            // Handle workspace folders (modern LSP approach)
+            if body.params.workspaceFolders {
+                log("Initializing with % workspace folders", body.params.workspaceFolders.count);
+                for folder: body.params.workspaceFolders.* {
+                    folder_path := normalize_path(folder.uri,, temp);
+                    log("Adding workspace folder: % (%)", folder.name, folder_path);
 
-            server.project_root = copy_string(body.params.rootPath.*);
-
-            load_config_file();
-
-            if server.build_root.count == 0 {
-                server.build_root = find_entry_file(server.project_root);
-            }
-
-            if server.roots.count == 0 {
-                server.roots = .[find_entry_file(server.project_root)];
-            }
-
-            // Include $workingDirectory/modules as a default local module path (like a compiler)
-            array_add_if_unique(*server.local_modules, "modules");
-
-            log("Server.local_modules: %", server.local_modules);
-            log("Server.roots: %", server.roots);
-            log("Server.intermediate_path: %", server.intermediate_path);
-
-            for root: server.roots {
-                absolute_path: string;
-                if starts_with(root, "/") {
-                    absolute_path = root;
-                } else {
-                    absolute_path = join(server.project_root, root, separator="/",, temp);
+                    array_add(*server.workspace_folders, copy_string(folder_path));
+                    initialize_project(folder_path);
                 }
-
-                absolute_path = normalize_path(absolute_path,, temp);
-                parse_file(absolute_path, true);
+            } else if body.params.rootPath && body.params.rootPath.* {
+                // Fallback for older LSP clients
+                log("Initializing with legacy rootPath: %", body.params.rootPath.*);
+                root_path := copy_string(body.params.rootPath.*); // Use default allocator for server-owned data
+                array_add(*server.workspace_folders, root_path);
+                initialize_project(root_path);
+            } else {
+                log("No workspace folders provided - LSP will wait for workspace/didChangeWorkspaceFolders");
             }
-
             // Parse Runtime Support and Preload
             {
                 parse_file(tprint("%/modules/Runtime_Support.jai", server.jai_path), true);
@@ -298,12 +404,11 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
                 return;
             }
 
-            run_diagnostics();
-
             file_path := normalize_path(body.params.textDocument.uri,, temp);
 
             parse_file(file_path, true);
             analyze_files();
+            run_diagnostics(file_path);
 
         case "textDocument/didOpen";
             success, body := json_parse_string(raw_request, LSP_Did_Open_Text_Document,, temp);
@@ -320,6 +425,7 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
 
             parse_file(file_path);
             analyze_files();
+            run_diagnostics(file_path);
 
             log("File_path: %", file_path);
 
@@ -393,7 +499,99 @@ handle_request :: (request: LSP_Request_Message, raw_request: string) {
             // }
 
             // handle_hover(body);
+
+        case "workspace/didChangeWorkspaceFolders";
+            success, body := json_parse_string(raw_request, LSP_Did_Change_Workspace_Folders,, temp);
+            if !success {
+                log_error("Unable to parse workspace/didChangeWorkspaceFolders message");
+                return;
+            }
+
+            handle_workspace_folders_change(body);
     }
+}
+
+handle_workspace_folders_change :: (request: LSP_Did_Change_Workspace_Folders) {
+    // Add new workspace folders
+    for folder: request.params.event.added {
+        folder_path := normalize_path(folder.uri,, temp);
+        log("Adding workspace folder: %", folder_path);
+
+        // Add to workspace folders if not already present
+        found := false;
+        for existing: server.workspace_folders {
+            if existing == folder_path {
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            // Use default allocator for server-owned workspace folders array
+            array_add(*server.workspace_folders, copy_string(folder_path));
+
+            // Load config for new project
+            project := load_config_for_project(folder_path);
+
+            // Parse root files for new project
+            for root: project.roots {
+                absolute_path: string;
+                if starts_with(root, "/") {
+                    absolute_path = root;
+                } else {
+                    absolute_path = join(folder_path, root, separator="/",, temp);
+                }
+
+                absolute_path = normalize_path(absolute_path,, temp);
+                parse_file(absolute_path, true);
+            }
+        }
+    }
+
+    // Remove workspace folders
+    for folder: request.params.event.removed {
+        folder_path := normalize_path(folder.uri,, temp);
+        log("Removing workspace folder: %", folder_path);
+
+        // Remove from workspace folders
+        i := server.workspace_folders.count - 1;
+        while i >= 0 {
+            if server.workspace_folders[i] == folder_path {
+                free(server.workspace_folders[i]);
+                array_ordered_remove_by_index(*server.workspace_folders, i);
+                break;
+            }
+            i -= 1;
+        }
+
+        // Free project allocator before removing
+        project := table_find_pointer(*server.projects, folder_path);
+        if project {
+            release(*project.pool);
+        }
+
+        // Remove project config (this also frees the key string)
+        table_remove(*server.projects, folder_path);
+
+        // Remove files belonging to this project
+        files_to_remove: [..]*Program_File;
+        for file: server.files {
+            if begins_with(file.path, folder_path) {
+                array_add(*files_to_remove, file);
+            }
+        }
+
+        for file: files_to_remove {
+            // Free the Program_File and its resources
+            free(file.path);
+            release(*file.ast_pool);
+            release(*file.analysis_pool);
+            free(file);
+            table_remove(*server.files, file.path);
+        }
+    }
+
+    analyze_files();
 }
 
 main :: () {
@@ -428,6 +626,9 @@ main :: () {
             log("Jai path: %", server.jai_path);
         }
     }
+
+    init(*server.projects);
+    defer deinit(*server.projects);
 
     init(*server.files);
     defer deinit(*server.files);
@@ -479,6 +680,7 @@ main :: () {
 #import "jai_parser";
 #import "Default_Allocator";
 #import "System";
+#import "xxHash";
 
 #load "rpc.jai";
 #load "lsp_interface.jai";

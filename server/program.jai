@@ -98,7 +98,7 @@ pool_alloc :: (pool: *Pool) -> Allocator {
 
 parse_file :: (path: string, force := false) {
     // Reset back to default allocator, we dont want to use pool from "parent" file...
-    context.allocator = context.default_allocator;
+    push_allocator(context.default_allocator);
 
     ok, file := table_find_new(*server.files, path);
     if !force && ok {
@@ -293,19 +293,21 @@ get_module_import_path :: (_import: *Directive_Import, current_path: string) -> 
         return "";
     }
 
-    get_module :: (module_name: string) -> string {
-        for local_modules_folder: server.local_modules {
-            absolute_path: string;
-            if is_absolute_path(local_modules_folder) {
-                absolute_path = local_modules_folder;
-            } else {
-                absolute_path = join(server.project_root, local_modules_folder, separator="/");
+    get_module :: (module_name: string, project: *Project_Config) -> string {
+        if project {
+            for local_modules_folder: project.local_modules {
+                absolute_path: string;
+                if is_absolute_path(local_modules_folder) {
+                    absolute_path = local_modules_folder;
+                } else {
+                    absolute_path = join(project.project_root, local_modules_folder, separator="/");
+                }
+
+                absolute_path = normalize_path(absolute_path);
+
+                entry := get_module_entry(join(absolute_path, module_name, separator="/"));
+                if entry.count > 0 return entry;
             }
-
-            absolute_path = normalize_path(absolute_path);
-
-            entry := get_module_entry(join(absolute_path, module_name, separator="/"));
-            if entry.count > 0 return entry;
         }
 
         jai_modules := join(server.jai_path, "/modules");
@@ -318,9 +320,12 @@ get_module_import_path :: (_import: *Directive_Import, current_path: string) -> 
 
     path: string;
 
+    // Find project context for current file
+    project := find_project_for_file(current_path);
+
     if _import.import_kind == {
         case .MODULE;
-            path = get_module(_import.module);
+            path = get_module(_import.module, project);
             if path.count == 0 return "";
         case .FILE;
             path = sprint("%/%", current_path, _import.module);

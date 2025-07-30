@@ -44,6 +44,14 @@ remove_memory_file :: (file_path: string) {
     if !ok return;
     array_free(content);
 
+    // Find and free the key before removing
+    for value, key: server.memory_files {
+        if key == file_path {
+            free(key);
+            break;
+        }
+    }
+
     found := table_remove(*server.memory_files, file_path);
     if !found {
         log_error("Tried to remove file % but it was not in the server.memory_files table!", file_path);

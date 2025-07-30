@@ -113,9 +113,12 @@ handle_completitions_import :: (request: LSP_Request_Message_Completion, directi
     visit_files(modules_dir, false, *completions, visit_modules, true, true);
 
     // Local modules
-    for local_module: server.local_modules {
-        local_modules_dir := sprint("%/%", server.project_root, local_module);
-        visit_files(local_modules_dir, false, *completions, visit_modules, true, true);
+    project := find_project_for_file(request.params.textDocument.uri);
+    if project {
+        for local_module: project.local_modules {
+            local_modules_dir := sprint("%/%", project.project_root, local_module);
+            visit_files(local_modules_dir, false, *completions, visit_modules, true, true);
+        }
     }
 
     lsp_respond(request.id, completions);
@@ -295,7 +298,8 @@ send_completions_decls :: (request: LSP_Request_Message_Completion, decls: []*De
                 procedure := cast(*Procedure) preview_node;
                 deprecated = procedure.deprecated_note.count > 0;
 
-                if server.user_options.auto_insert_parentheses {
+                project := find_project_for_file(request.params.textDocument.uri);
+                if project && project.user_options.auto_insert_parentheses {
                     insert_text = sprint("%($0)", decl.name);
                 } else {
                     insert_text = decl.name;
